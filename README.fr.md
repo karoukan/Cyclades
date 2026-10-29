@@ -12,11 +12,11 @@ Une messagerie chiffrée de bout en bout qui continue de fonctionner quand le r�
 
 Au début des années 1970, Louis Pouzin et son équipe de l'IRIA construisent Cyclades, l'un des premiers réseaux à commutation de paquets. Leur idée : un réseau qui se contente de transporter des paquets, et des machines aux extrémités qui font le reste. Cette idée inspirera TCP/IP. En France, le projet est abandonné à la fin de la décennie au profit de Transpac, le réseau des PTT, sur lequel tournera le Minitel.
 
-Ce Cyclades-ci reprend le même principe : le réseau ne sait rien, ce sont les téléphones qui font le travail.
+Ce Cyclades-ci part de la même idée : au milieu, on se contente de transporter, et tout le reste se fait aux extrémités. Il la pousse un cran plus loin : ceux qui relaient un message ne peuvent même pas le lire.
 
 ## Ce que ça fait
 
-Les téléphones se parlent directement en Bluetooth basse consommation et se relaient les messages de proche en proche. Ça marche sans antenne, sans Wi-Fi et sans internet. Quand internet est disponible, un relais peut transmettre les messages plus loin. Il ne voit que des enveloppes chiffrées et ne sait pas qui parle à qui.
+Les téléphones se parlent directement en Bluetooth basse consommation et se relaient les messages de proche en proche. Ça marche sans antenne, sans Wi-Fi et sans internet. Quand internet est disponible, un relais peut transmettre les messages plus loin. Il ne voit que des enveloppes chiffrées et ne connaît aucun compte ni aucun nom. Il voit en revanche les adresses IP qui s'y connectent. Le relais est facultatif : sans lui, tout passe par le Bluetooth.
 
 - Pas de compte, pas de numéro de téléphone, pas d'adresse e-mail.
 - On ajoute un contact en face à face, en scannant un QR code puis en comparant un code à six chiffres.
@@ -37,11 +37,11 @@ Le code sera publié ici au fur et à mesure.
 ## Transparence
 
 Conception, choix techniques et tests sur de vrais appareils : moi.
-Le code et la documentation sont écrits avec l'aide d'un assistant IA (Claude), puis relus, testés et validés par moi. Les vecteurs de test cryptographiques sont recalculés par des implémentations indépendantes.
+Le code (en partie) et la documentation sont écrits avec l'aide d'un assistant IA (Claude), puis relus, testés et validés par moi. Les vecteurs de test cryptographiques sont recalculés par des implémentations indépendantes.
 
 ## Sécurité
 
-Une faille, un doute ? Écrivez moi.
+Une faille, un doute ? Signalez-la en privé via l'onglet Security → Report a vulnerability.
 Merci de ne pas ouvrir de ticket public pour une faille de sécurité.
 
 ## Licence
