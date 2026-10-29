@@ -32,6 +32,7 @@ These leaks are inherent to an online relay. The protocol limits what an honest 
 - Which connection deposits to which mailbox, and when.
 - Which mailboxes a single connection joins, which links those mailboxes together.
 - The size tier of each envelope and the activity volume of each mailbox.
+- For a group mailbox (section 5.2): the connections that join it, so the network addresses of its members and the size of the group. Its envelopes are never acknowledged, so a seized relay holds up to 24 hours of them, read or not.
 
 Clients reduce these leaks with the measures in section 12 (mailbox rotation, one mailbox per connection, anonymizing networks such as Tor).
 
@@ -94,6 +95,16 @@ These checks are mandatory, not redundant: libraries disagree on these inputs. E
 
 One divergence remains. A key with a small-order component (mixed order) can be crafted so that implementations using cofactored and cofactorless verification disagree. Only someone crafting their own mailbox key can produce one, and since the `mailbox_id` commits to the key, it only affects that person's own mailbox. Keys MUST be generated with a standard library (CryptoKit, libsodium, Erlang/OTP), which never yields such keys.
 
+### 5.2 Group mailboxes
+
+A group mailbox is shared by the members of a group, who read it without deleting anything (`CLIENT-CRYPTO.md` section 7).
+
+- `group_mailbox_id = SHA-256("cyclades/v0/group" || group_pubkey)`, 32 bytes. Group mailboxes form a namespace of their own: the relay keys envelopes by kind and id, so a group mailbox and a private mailbox with the same 32 bytes never share envelopes. A deposit marked as group to the id of a private mailbox lands where nobody can join, like a deposit to an invented mailbox.
+- Deposits and joins say `"group": true` (sections 7.1 and 7.2).
+- Every envelope of a group mailbox expires 24 hours after its deposit (`group_ttl`), whatever `ttl` the deposit asks for. 24 hours is also the `max_ttl` of pressure mode (section 9.3), so expiration follows the order of deposit, in pressure mode too. Section 7.3 relies on it.
+- Envelopes of a group mailbox leave by expiration only. `ack` and `purge` are refused, so no member, and no seized member phone, can delete them for the others.
+- The relay keeps no registry of group mailboxes either: one exists only while it holds envelopes.
+
 ## 6. Session
 
 When a socket connects, the relay generates a `nonce` of 32 random bytes. It is bound to that connection and is never reused. A new connection always gets a new nonce.
@@ -135,11 +146,12 @@ Anyone can deposit. The sender is not authenticated and stays anonymous to the r
 Event `deposit` on topic `session`:
 
 ```json
-{"mailbox_id": "<32 bytes>", "blob": "<1024, 4096 or 16384 bytes>", "ttl": 86400, "pow": "<64 bytes>"}
+{"mailbox_id": "<32 bytes>", "blob": "<1024, 4096 or 16384 bytes>", "ttl": 86400, "pow": "<64 bytes>", "group": false}
 ```
 
 - `blob`, once decoded, MUST be exactly one of the size tiers. Any other length is rejected with `invalid_size`.
 - `ttl` is optional and given in seconds. It defaults to `max_ttl` and is clamped to `[min_ttl, max_ttl]`.
+- `group` is optional and defaults to `false`. With `true`, the envelope goes to the group mailbox `mailbox_id` (section 5.2): `ttl` is ignored, the envelope expires after `group_ttl`, and the group quota applies (section 9.1).
 - `pow` is required only in pressure mode (section 9.3). Without a sufficient proof, the relay replies `pow_required`.
 - On success the relay stores the envelope and replies with the current state, `{"max_ttl": 604800, "pow_bits": 0, "full": false}`. Success means stored, not delivered.
 - The relay checks a deposit in this order, and replies with the first failure: `invalid_payload` and `invalid_size`, then `rate_limited`, then `pow_required`, then `relay_full`, then `mailbox_full`. In pressure mode, only a depositor who paid the proof therefore learns whether the relay or a mailbox is full.
@@ -149,7 +161,7 @@ Event `deposit` on topic `session`:
 Topic `mailbox:<mailbox_id>`, join payload:
 
 ```json
-{"pubkey": "<32 bytes>", "sig": "<64 bytes>"}
+{"pubkey": "<32 bytes>", "sig": "<64 bytes>", "group": false}
 ```
 
 where
@@ -164,6 +176,8 @@ The relay accepts the join only if:
 2. `sig` is a valid signature of `"cyclades/v0/join" || nonce || mailbox_id` under `pubkey`, using the nonce of this connection.
 
 Otherwise it replies `unauthorized`. Both checks fail with the same error.
+
+For a group mailbox, the join says `"group": true` and check 1 becomes `SHA-256("cyclades/v0/group" || pubkey)`. The signed message is the same.
 
 A connection MAY join up to `max_mailboxes` mailboxes. The signature is computed once per join. The channel process then stays bound to the mailbox, so `fetch`, `ack` and `purge` need no further signature. Replaying a join signature on another connection fails because the nonce differs.
 
@@ -187,6 +201,18 @@ Reply:
 - Expired envelopes are never returned, even if they have not been purged yet.
 - Because ids are random, an envelope deposited during pagination can sort before the current `after` cursor and be skipped. After acknowledging a batch, the client MUST start again from the beginning (without `after`), and repeat until a fetch returns no envelope.
 
+**Group mailboxes.** A fetch reads without deleting and takes `since`, so that a member does not read the whole mailbox at each visit:
+
+```json
+{"limit": 100, "since": 1793289600, "after": "<16 bytes, optional>"}
+```
+
+- `since` is an expiration hour, in Unix seconds, a multiple of 3600; any other value is rejected with `invalid_payload`. The relay returns the envelopes whose `expires_at` is at or after `since`, in ascending order of `expires_at`, then of `id`, each as `{"id", "blob", "expires_at"}`. Without `since`, the fetch starts from the oldest envelope.
+- To page through, the client sends `since` = the `expires_at` of the last envelope received and `after` = its id. The relay returns what comes strictly after the pair (`since`, `after`) in that order: a later `expires_at`, or the same one and a greater `id`. It does not look that envelope up, so the cursor still holds when the envelope has expired in between, at each change of hour. `after` without `since` is rejected with `invalid_payload` on a group mailbox.
+- On a private mailbox, `since` is rejected with `invalid_payload`.
+- `since` reveals nothing new: `expires_at` is already stored, and it already gives away the hour of deposit (section 8). A cursor based on a deposit counter would reveal how many messages the group has exchanged since its mailbox first held an envelope, so version 0 has none.
+- Within one expiration hour, the order is that of the random ids, so an envelope deposited during the pagination can sort before the cursor and be skipped, as above. A member MUST therefore join the group mailbox before fetching, so that real-time delivery (section 7.6) brings every envelope deposited in the meantime. It then fetches from the expiration hour of the last envelope it already holds, drops the envelopes it already has, and stops when a full pass from that `since` brings nothing new.
+
 ### 7.4 ack
 
 Event `ack` on a joined mailbox topic:
@@ -195,15 +221,15 @@ Event `ack` on a joined mailbox topic:
 {"ids": ["<16 bytes>", "..."]}
 ```
 
-At most `fetch_limit` ids per call. The relay deletes the listed envelopes that belong to this mailbox, ignores the others without saying so, and replies `{}`. Acknowledging the same id twice is harmless.
+At most `fetch_limit` ids per call. The relay deletes the listed envelopes that belong to this mailbox, ignores the others without saying so, and replies `{}`. Acknowledging the same id twice is harmless. On a group mailbox, `ack` is refused with `not_allowed`.
 
 ### 7.5 purge
 
-Event `purge` on a joined mailbox topic, empty payload. It deletes every envelope of the mailbox and replies `{}`. A client uses it when it abandons a mailbox, for example after a flood.
+Event `purge` on a joined mailbox topic, empty payload. It deletes every envelope of the mailbox and replies `{}`. A client uses it when it abandons a mailbox, for example after a flood. On a group mailbox, `purge` is refused with `not_allowed`.
 
 ### 7.6 Real-time delivery
 
-When an envelope is deposited, the relay pushes the event `envelope` with `{"id", "blob"}` on the topic `mailbox:<mailbox_id>` to every connection that has joined that mailbox. The envelope stays stored until it is acknowledged or expires.
+When an envelope is deposited, the relay pushes the event `envelope` with `{"id", "blob"}` on the topic `mailbox:<mailbox_id>` to every connection that has joined that mailbox, with `expires_at` for a group mailbox. The envelope stays stored until it is acknowledged or expires.
 
 ## 8. Envelopes
 
@@ -214,7 +240,8 @@ An envelope holds:
 | `id` | 16 random bytes from a CSPRNG |
 | `mailbox_id` | 32 bytes |
 | `blob` | exactly 1024, 4096 or 16384 bytes |
-| `expires_at` | `now + ttl`, rounded up to a full hour (ceiling: a value already on a full hour stays as is) |
+| `kind` | private or group (section 5.2) |
+| `expires_at` | `now + ttl`, or `now + group_ttl` for a group mailbox, rounded up to a full hour (ceiling: a value already on a full hour stays as is) |
 
 - No creation timestamp is stored. Rounding `expires_at` to the hour still reveals the deposit hour when the TTL is known. This one-hour granularity is the accepted residual leak.
 - Ids are random, never sequential, so they reveal neither the global message volume nor the deposit order.
@@ -230,9 +257,14 @@ All values are configurable defaults, to be tuned with real traffic.
 | Scope | Limit | On overflow |
 |---|---|---|
 | Mailbox | 500 envelopes or 4 MiB, whichever comes first | `mailbox_full` |
+| Group mailbox | 2000 envelopes or 16 MiB, whichever comes first | `mailbox_full` |
 | Relay | total storage cap set by the operator (default 1 GiB) | `relay_full` |
 
 When a mailbox is full, new deposits are refused and existing envelopes are kept. The relay never drops old envelopes to make room, because that would let an attacker flush legitimate messages. A flooded recipient gets around the attack on the client side by rotating mailboxes (section 12).
+
+Group envelopes stay until they expire, read or not, since nobody acknowledges them. Like any deposit, they count against the byte budgets of their network origin (section 9.2) and against the storage cap that drives pressure mode (section 9.3), which bound the room they take.
+
+A member of a group, or the seized phone of a member, can fill the group mailbox, at the per-mailbox rate of section 9.2 in 9 to 17 minutes, and silence the group at the relay for up to 24 hours: there is no purge to undo it. Version 0 accepts this cost. The admin then moves the group to a new group mailbox, as after a removal (`CLIENT-CRYPTO.md` section 7). If the flooder is not identified, the new mailbox can be flooded again, and the group falls back on the Bluetooth mesh.
 
 ### 9.2 Rate limits and byte budgets
 
@@ -301,6 +333,7 @@ Errors are channel replies with status `error` and the payload `{"reason": "<cod
 | `rate_limited` | rate limit or byte budget exceeded |
 | `pow_required` | pressure mode: proof of work missing, insufficient or reused |
 | `too_many_mailboxes` | too many mailboxes joined on this connection |
+| `not_allowed` | `ack` or `purge` on a group mailbox |
 
 ## 11. Requirements for relay implementations
 
@@ -343,8 +376,9 @@ Errors are channel replies with status `error` and the payload `{"reason": "<cod
 - **Follow the state**: read it on joining `session`, in every deposit reply and in `state` events. When `full` is true, do not attempt a deposit: it would be refused, after the proof of work in pressure mode. Wait for a later `state`, or carry the message over the Bluetooth mesh.
 - **Warn the user in pressure mode**: messages sent while it is active expire after `max_ttl` (24 hours by default) instead of 7 days, and sending takes longer because of the proof of work. Large content is better sent later, or over the Bluetooth mesh.
 - **Pad before encrypting**: the ciphertext, headers and authentication tag included, must exactly match a tier. The padding scheme belongs to the client cryptography specification.
-- **Acknowledge everything fetched**, including envelopes that fail to decrypt, otherwise they use up the mailbox quota until they expire.
-- **One device per mailbox**: an acknowledgement deletes the envelope for every connection, so version 0 does not support several devices sharing a mailbox.
+- **Acknowledge everything fetched** in a private mailbox, including envelopes that fail to decrypt, otherwise they use up the mailbox quota until they expire. Never acknowledge in a group mailbox.
+- **One device per private mailbox**: an acknowledgement deletes the envelope for every connection, so version 0 does not support several devices sharing a private mailbox. A group mailbox can be read by several devices.
+- **Read a group mailbox in order**: join it first, then fetch from the expiration hour of the last envelope held, until a full pass brings nothing new (section 7.3). A member away for more than 24 hours misses the group envelopes at the relay.
 - **Large content**: split it into envelopes on the client side.
 - **Do not trust the relay for time or ordering**: use timestamps and counters carried inside the encrypted payload.
 
@@ -428,10 +462,20 @@ Both of the following MUST be rejected:
 - P1, insufficient: the same `pow` for a deposit that requires `bits = 12`. `hash_7` has only 8 zero bits, one short of the 9 required.
 - P2, misplaced: the same `pow` with `pow_0` and `pow_1` swapped. Both hashes still start with 8 zero bits, but the first byte of each sub-proof no longer equals its position.
 
+### 15.4 Group mailbox
+
+Same key as 15.1.
+
+```
+pubkey            8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c
+group_mailbox_id  02dc045bb0b679e6cd81c92efb1125d24e57f9e8604b40a4e6634afd8f5d4b17
+group64           AtwEW7C2eebNgcku-xEl0k5X-ehgS0Ck5mNK_Y9dSxc
+```
+
 ## 16. Open points
 
-Decided for version 0: expiration rounded to one hour, memory-only storage by default, 24-hour expiration in pressure mode, SHA-256 proof of work in 8 sub-proofs with `B = 21` (a memory-hard function comes in a later version).
+Decided for version 0: expiration rounded to one hour, memory-only storage by default, 24-hour expiration in pressure mode, SHA-256 proof of work in 8 sub-proofs with `B = 21` (a memory-hard function comes in a later version), group mailboxes read without deletion and kept 24 hours (section 5.2).
 
 1. **Default limits** (section 9): starting values, to be revisited after the first real deployments. `B = 21` is calibrated on a Snapdragon 665. It goes down if older phones are targeted, and is checked against the A12 once measured.
-2. **Group delivery**, to be decided with the group cryptography (Sender Keys). Version 0 assumes fan-out, one deposit per member mailbox. It is simple, but the relay sees a burst of deposits from one connection and can infer the group size. A shared group mailbox would need non-destructive reads (no deletion on ack, expiry only, a client-side cursor).
+2. **Group mailboxes**: the relay sees the network addresses of the members who fetch them (section 2.2). Members who must hide it use an anonymizing network. Delivering one copy to each member's own mailbox would not hide it either: the relay would see bursts of deposits linking those mailboxes, and in pressure mode every member would cost a proof of work.
 3. **Federation trust model**: which relays replicate to which, and what a replicating relay learns.
