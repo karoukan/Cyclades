@@ -48,4 +48,4 @@ Please do not open a public issue for a security vulnerability.
 
 [AGPL-3.0](LICENSE). If you modify Cyclades and distribute it, or run it as a service, you must publish your source code.
 
-Specifications in doc/ are under CC BY-SA 4.0.
+Specifications in docs/ are under CC BY-SA 4.0.
