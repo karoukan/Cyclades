@@ -47,3 +47,5 @@ Merci de ne pas ouvrir de ticket public pour une faille de sécurité.
 ## Licence
 
 [AGPL-3.0](LICENSE). Si vous modifiez Cyclades et le distribuez, ou le faites tourner comme service, vous devez publier vos sources.
+
+Les spécifications dans doc/ sont sous CC BY-SA 4.0.

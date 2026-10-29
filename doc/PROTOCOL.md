@@ -1,11 +1,9 @@
-> Brouillon, non audité.
-
 # Cyclades relay protocol, version 0
 
 - Status: draft, not audited. Validated design; the reference relay is not published yet. Default limits are provisional (section 16).
 - Version: 0, October 2026 (design started in May 2026).
 - Authors: the Cyclades project.
-- Contact: GitHub issues, https://github.com/karoukan/Cyclades/issues
+- Contact: security issues privately via the Security tab (Report a vulnerability); everything else in GitHub issues.
 - License: CC BY-SA 4.0, https://creativecommons.org/licenses/by-sa/4.0/
 - Related, not published yet: `MESH.md` (Bluetooth mesh), `CLIENT-CRYPTO.md` (client cryptography), `NEARBY.md` (recognising nearby contacts).
 
