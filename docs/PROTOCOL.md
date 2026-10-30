@@ -61,7 +61,8 @@ Clients reduce these leaks with the measures in section 12 (mailbox rotation, on
 - Phoenix Channels over WebSocket, at `/relay/websocket`, with the Phoenix V2 JSON serializer (`vsn=2.0.0`).
 - TLS is REQUIRED in production. It is usually terminated by a reverse proxy in front of the relay.
 - The socket connection carries no parameters and no identity.
-- Frames larger than 32 KiB are rejected.
+- Messages larger than 32 KiB are rejected and close the connection, whether they come in one frame or in fragments.
+- The client completes a message at least every 30 seconds: a Phoenix heartbeat (topic `phoenix`, event `heartbeat`) when it has nothing else to send. A relay MAY close a connection that completes no message for a minute, whatever bytes arrive (section 9.4).
 
 ## 5. Mailboxes and keys
 
@@ -125,10 +126,13 @@ The relay replies with:
   "max_ttl": 604800,
   "max_mailboxes": 32,
   "fetch_limit": 100,
+  "fetch_max_bytes": 524288,
   "pow_bits": 0,
   "full": false
 }
 ```
+
+`fetch_limit` and `fetch_max_bytes` bound a fetch reply (section 7.3).
 
 `max_ttl`, `pow_bits` and `full` reflect the relay's current state and change in pressure mode (section 9.3). `full` is true once the smallest envelope no longer fits under the storage cap. Connected clients learn about changes in two ways:
 
@@ -181,6 +185,8 @@ For a group mailbox, the join says `"group": true` and check 1 becomes `SHA-256(
 
 A connection MAY join up to `max_mailboxes` mailboxes. The signature is computed once per join. The channel process then stays bound to the mailbox, so `fetch`, `ack` and `purge` need no further signature. Replaying a join signature on another connection fails because the nonce differs.
 
+A mailbox is joined by at most 4 connections at once if it is private, and 128 if it is a group mailbox. Beyond that the join is refused with `mailbox_busy`, and a place frees when one of those connections leaves or closes. These bounds keep one deposit from being pushed to an unbounded number of connections (section 7.6). 4 leave room for a phone whose previous connections have not yet been closed after a network change: the relay closes a silent connection after 60 seconds, so a client refused with `mailbox_busy` retries later. 128 is more than twice the 50 members of the largest group (`CLIENT-CRYPTO.md`, D3): when the mobile network drops for a whole crowd at once, every member comes back on a new connection while its previous one keeps its place for up to 60 seconds. The cost for groups is in section 9.1.
+
 ### 7.3 fetch
 
 Event `fetch` on a joined mailbox topic:
@@ -197,6 +203,7 @@ Reply:
 
 - Envelopes are returned in ascending order of `id` (byte order). `after` pages through them.
 - `limit` is capped at `fetch_limit`.
+- A reply also stops before the envelope that would take its blobs past `fetch_max_bytes`, but always holds at least one envelope, and `more` is then true. A reply can therefore hold fewer than `limit` envelopes while more remain: the client pages on as long as `more` is true. This holds for group mailboxes too.
 - The order carries no meaning. Ids are random, so it is not the deposit order. Clients rely on timestamps and counters inside the encrypted payload.
 - Expired envelopes are never returned, even if they have not been purged yet.
 - Because ids are random, an envelope deposited during pagination can sort before the current `after` cursor and be skipped. After acknowledging a batch, the client MUST start again from the beginning (without `after`), and repeat until a fetch returns no envelope.
@@ -230,6 +237,8 @@ Event `purge` on a joined mailbox topic, empty payload. It deletes every envelop
 ### 7.6 Real-time delivery
 
 When an envelope is deposited, the relay pushes the event `envelope` with `{"id", "blob"}` on the topic `mailbox:<mailbox_id>` to every connection that has joined that mailbox, with `expires_at` for a group mailbox. The envelope stays stored until it is acknowledged or expires.
+
+Real-time delivery is best effort. A connection that does not read what the relay sends would keep every push in the relay's memory, so when more than 8 messages wait to be sent on a connection, the relay pushes nothing more to it and closes it with WebSocket close code 1013 (Try Again Later) rather than 1000 (Normal Closure), so that a client and a log can tell the two apart. It also closes a connection on which sending one message stays blocked for 5 seconds. Nothing is lost: the envelopes stay stored, and the client gets them by fetching once it has joined again (section 12). On a 1013, as on any closing, the client reconnects on its own.
 
 ## 8. Envelopes
 
@@ -266,17 +275,26 @@ Group envelopes stay until they expire, read or not, since nobody acknowledges t
 
 A member of a group, or the seized phone of a member, can fill the group mailbox, at the per-mailbox rate of section 9.2 in 9 to 17 minutes, and silence the group at the relay for up to 24 hours: there is no purge to undo it. Version 0 accepts this cost. The admin then moves the group to a new group mailbox, as after a removal (`CLIENT-CRYPTO.md` section 7). If the flooder is not identified, the new mailbox can be flooded again, and the group falls back on the Bluetooth mesh.
 
+In the same way, a member, or the seized phone of a member, can hold the 128 places of the group mailbox (section 7.2) with connections of its own, and keep the other members from joining it, so from reading it at the relay, for as long as it keeps them open. Version 0 accepts this cost too, for the same reason: only a member can join, and no relay-side rule tells a member who holds places from one who reads. The answer is the same: the admin moves the group to a new group mailbox, as after a removal, and the group falls back on the Bluetooth mesh if the culprit is not identified.
+
 ### 9.2 Rate limits and byte budgets
 
-Limits apply per connection, per mailbox and per network origin. The network origin is the IPv4 address, or the /64 prefix of an IPv6 address (section 11.2).
+Limits apply per connection, per mailbox, per network origin, and to the whole relay for bytes served. The network origin is the IPv4 address, or the /64 prefix of an IPv6 address (section 11.2).
 
-| Scope | Deposits | Bytes deposited | 16 KiB envelopes | Other |
-|---|---|---|---|---|
-| Connection | 300 / min | 2 MiB / min | 30 / min | 30 joins and 120 fetches / min, at most `max_mailboxes` joined at once |
-| Network origin | 3000 / min | 16 MiB / min and 256 MiB / hour | 300 / min | 600 joins / min |
-| Mailbox | 120 / min | | | |
+| Scope | Deposits | Bytes deposited | 16 KiB envelopes | Bytes served | Other |
+|---|---|---|---|---|---|
+| Connection | 300 / min | 2 MiB / min | 30 / min | 16 MiB / min | 30 joins and 120 fetches, acks and purges / min, at most `max_mailboxes` joined at once |
+| Network origin | 3000 / min | 16 MiB / min and 256 MiB / hour | 300 / min | 16 MiB / min, at most 4 MiB at once | 600 joins / min |
+| Mailbox | 120 / min | | | | |
+| Relay | | | | 64 MiB / min, at most 16 MiB at once | |
 
-Exceeding a limit returns `rate_limited`, or `too_many_mailboxes` for the number of joined mailboxes.
+Exceeding a limit returns `rate_limited`, or `too_many_mailboxes` for the number of joined mailboxes. Caps on connections are in section 9.4.
+
+Each limit is a token bucket. It refills continuously at its rate and holds at most one minute of it (one hour for the hourly budget), or the amount given as "at most". A client that has waited long enough can spend a whole minute at once, but never two in a row: with fixed windows, it could spend one just before the turn of a minute and another just after. A request refused with `rate_limited` takes nothing from any bucket.
+
+Bytes served are the envelope bytes of fetch replies. A fetch first takes `fetch_max_bytes` from its budgets and gives back what its reply did not use, so that concurrent fetches cannot overdraw them. A client that stops reading leaves its replies waiting in the relay's memory until the relay closes the connection, and per-origin budgets cannot bound that memory against an attacker who uses many addresses. The relay-wide budget does. Once it is used up, every fetch is refused with `rate_limited` until it refills: such an attacker can delay fetches for everyone, but cannot exhaust the relay's memory. Real-time delivery (section 7.6) does not count against it.
+
+The budget of a network origin is a quarter of the relay-wide one: it takes at least four origins to use the relay-wide budget up, so one address alone cannot delay the fetches of everyone else. The bound is only as strong as the notion of origin: a subscriber holding a /56 has 256 IPv6 origins, and an operator who disables per-origin limits removes it. A crowd behind one address shares 16 MiB of fetches per minute, real-time delivery aside. `fetch_max_bytes` must stay at most the 4 MiB burst of the origin budget, otherwise every fetch is refused.
 
 Every well-formed deposit counts against the deposit limit of its connection, accepted or not. Only accepted deposits count against the limits of the network origin and of the mailbox, and against byte budgets. A refused deposit, in particular one without a sufficient proof in pressure mode, therefore never consumes a budget shared with others. Otherwise one attacker behind a shared address (carrier-grade NAT, the Wi-Fi of a venue) could use up the budget of the whole crowd behind it for free, with deposits that cost them nothing.
 
@@ -318,6 +336,14 @@ A deposit without a sufficient proof gets `pow_required` with the number of `bit
 
 Since the cost grows with the size, a 16 KiB envelope at the first threshold takes about 10 seconds on average on the calibration phone, and 17 seconds at the 95th percentile. SHA-256 is cheap on graphics cards and dedicated hardware: this proof slows floods from ordinary machines and fleets of phones, not a well-equipped attacker. A memory-hard function is planned for a later version (section 14).
 
+### 9.4 Connections
+
+Every open connection costs the relay memory: about 270 KiB, measured, for one that holds a frame left unfinished and has joined two mailboxes. A relay MAY cap the connections it holds at once, in total and per network origin, and refuse the WebSocket upgrade beyond with HTTP status 403. A refused upgrade frees its place at once. These are operator values, set from the memory of the host: the reference relay, sized for a 512 MiB container, holds at most 400 connections, 64 per network origin. A per-origin cap also refuses, beyond it, the members of a crowd behind one address (carrier-grade NAT, the Wi-Fi of a venue).
+
+A relay MAY also close a connection that completes no message for a minute, whatever bytes arrive. Without that, a frame left unfinished and fed one byte at a time keeps a connection and its buffers open for ever, since each byte resets the idle timeout of the transport. The reference relay checks every minute that at least one message has completed on the connection since the previous check. Otherwise it closes the connection with close code 1013, as in section 7.6, and at once: waiting for the client's close frame would hold it up to another minute. A client sends a heartbeat at least every 30 seconds (section 4).
+
+A cap moves the cost of a flood of connections instead of removing it. Past it, new connections are refused for everyone until some close: an attacker with enough addresses can keep new clients out, but can no longer bring the relay down, which would lose every stored envelope. The real defence of a relay in service is more memory, then several relays (section 14).
+
 ## 10. Errors
 
 Errors are channel replies with status `error` and the payload `{"reason": "<code>"}`. `pow_required` also carries `bits`. Error replies to `deposit` also carry the current `max_ttl` and `pow_bits` (section 6).
@@ -333,6 +359,7 @@ Errors are channel replies with status `error` and the payload `{"reason": "<cod
 | `rate_limited` | rate limit or byte budget exceeded |
 | `pow_required` | pressure mode: proof of work missing, insufficient or reused |
 | `too_many_mailboxes` | too many mailboxes joined on this connection |
+| `mailbox_busy` | too many connections have joined this mailbox (section 7.2) |
 | `not_allowed` | `ack` or `purge` on a group mailbox |
 
 ## 11. Requirements for relay implementations
@@ -373,11 +400,14 @@ Errors are channel replies with status `error` and the payload `{"reason": "<cod
 - **Limit linkage**: joining several mailboxes on one connection links them for the relay. Use one mailbox per connection when that matters, or an anonymizing network.
 - **Deposit on a separate connection**: never deposit to contacts on the connection that joins your own mailboxes. This also matters in pressure mode: a connection closes once it has accepted 1000 proofs (section 9.3), and with it every mailbox it had joined. If one connection joins mailbox M and deposits to mailboxes N1 to Nk, the relay learns that the owner of M writes to N1 to Nk, and can rebuild the social graph. Deposit connections SHOULD be short-lived. Both connections still share a network address unless an anonymizing network is used, and the delay between receiving and replying can correlate them.
 - **Recompute joins after every reconnection**: the nonce changes, so a cached join payload will be refused.
+- **Fetch after every join**: real-time delivery is best effort, and the relay closes a connection that does not keep up (section 7.6). After any closing, reconnect, join again, then fetch (from the expiration hour of the last envelope held, for a group mailbox).
+- **Retry on `mailbox_busy`**: after a network change, the previous connections of a phone keep their places until the relay closes them, within 60 seconds. Retry the join after at least 5 seconds: each attempt uses a join from the budget of the connection (section 9.2).
+- **Fit the pages to the link**: a client starts with a `limit` of 4. When its connection closes while it still awaits a fetch reply, it MUST halve its `limit` for the next fetches, down to 1. After 4 replies in a row received without a closing, it doubles it, up to `fetch_limit`. A client that keeps large pages on a slow link loops: a full page of 512 KiB takes about two minutes at 50 kbit/s, the relay closes the connection when the reply to the next heartbeat or push has waited 5 seconds behind it (section 7.6), and the client asks for the same page again.
 - **Follow the state**: read it on joining `session`, in every deposit reply and in `state` events. When `full` is true, do not attempt a deposit: it would be refused, after the proof of work in pressure mode. Wait for a later `state`, or carry the message over the Bluetooth mesh.
 - **Warn the user in pressure mode**: messages sent while it is active expire after `max_ttl` (24 hours by default) instead of 7 days, and sending takes longer because of the proof of work. Large content is better sent later, or over the Bluetooth mesh.
 - **Pad before encrypting**: the ciphertext, headers and authentication tag included, must exactly match a tier. The padding scheme belongs to the client cryptography specification.
 - **Acknowledge everything fetched** in a private mailbox, including envelopes that fail to decrypt, otherwise they use up the mailbox quota until they expire. Never acknowledge in a group mailbox.
-- **One device per private mailbox**: an acknowledgement deletes the envelope for every connection, so version 0 does not support several devices sharing a private mailbox. A group mailbox can be read by several devices.
+- **One device per person** (`CLIENT-CRYPTO.md`, D2): a private mailbox is read from a single device, and an acknowledgement deletes the envelope for every connection. A group mailbox is read from the device of each member.
 - **Read a group mailbox in order**: join it first, then fetch from the expiration hour of the last envelope held, until a full pass brings nothing new (section 7.3). A member away for more than 24 hours misses the group envelopes at the relay.
 - **Large content**: split it into envelopes on the client side.
 - **Do not trust the relay for time or ordering**: use timestamps and counters carried inside the encrypted payload.
